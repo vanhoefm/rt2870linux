@@ -998,7 +998,7 @@ VOID STASendPackets(
 				// Drop send request since hardware is in reset state
 					break;
 			}
-			else if (!INFRA_ON(pAd) && !ADHOC_ON(pAd))
+			else if (!INFRA_ON(pAd) && !ADHOC_ON(pAd) && !MONITOR_ON(pAd))
 			{
 				// Drop send request since there are no physical connection yet
 					break;
@@ -1085,10 +1085,17 @@ NDIS_STATUS STASendPacket(
 	MAC_TABLE_ENTRY *pEntry = NULL;
 	unsigned int 	IrqFlags;
 	UCHAR			Rate;
-	
+	int				i;
+
 	// Prepare packet information structure for buffer descriptor 
 	// chained within a single NDIS packet.
 	RTMP_QueryPacketInfo(pPacket, &PacketInfo, &pSrcBufVA, &SrcBufLen);
+
+	// Mathy: For some reason garbage is prepended to the frame?
+	// TODO: Investigate this in detail
+	for(i = 0; i + 14 < SrcBufLen; ++i)
+		pSrcBufVA[i] = pSrcBufVA[i + 14];
+	SET_OS_PKT_LEN(pPacket, SrcBufLen - 14);
 
 	if (pSrcBufVA == NULL)
 	{
@@ -1110,6 +1117,7 @@ NDIS_STATUS STASendPacket(
 	
 	// In HT rate adhoc mode, A-MPDU is often used. So need to lookup BA Table and MAC Entry. 
 	// Note multicast packets in adhoc also use BSSID_WCID index. 
+	if(!MONITOR_ON(pAd))
 	{
 		if(INFRA_ON(pAd))
 		{
@@ -1157,15 +1165,19 @@ NDIS_STATUS STASendPacket(
 			}
 			Rate = pAd->CommonCfg.TxRate;
 		}
-	}
 
-	if (!pEntry)
+		if (!pEntry)
+		{
+			DBGPRINT(RT_DEBUG_ERROR,("STASendPacket->Cannot find pEntry(%2x:%2x:%2x:%2x:%2x:%2x) in MacTab!\n", PRINT_MAC(pSrcBufVA)));
+			// Resourece is low, system did not allocate virtual address
+			// return NDIS_STATUS_FAILURE directly to upper layer
+			RELEASE_NDIS_PACKET(pAd, pPacket, NDIS_STATUS_FAILURE);
+			return NDIS_STATUS_FAILURE;
+		}
+	}
+	else
 	{
-		DBGPRINT(RT_DEBUG_ERROR,("STASendPacket->Cannot find pEntry(%2x:%2x:%2x:%2x:%2x:%2x) in MacTab!\n", PRINT_MAC(pSrcBufVA)));
-		// Resourece is low, system did not allocate virtual address
-		// return NDIS_STATUS_FAILURE directly to upper layer
-		RELEASE_NDIS_PACKET(pAd, pPacket, NDIS_STATUS_FAILURE);
-		return NDIS_STATUS_FAILURE;
+		pEntry = NULL;
 	}
 
 	if (ADHOC_ON(pAd)
@@ -1179,7 +1191,10 @@ NDIS_STATUS STASendPacket(
 	//		Here we set the PACKET_SPECIFIC flags(LLC, VLAN, DHCP/ARP, EAPOL).
 	UserPriority = 0;
 	QueIdx		 = QID_AC_BE;
-	RTMPCheckEtherType(pAd, pPacket, pEntry, &UserPriority, &QueIdx);
+	if(!MONITOR_ON(pAd))
+	{
+		RTMPCheckEtherType(pAd, pPacket, pEntry, &UserPriority, &QueIdx);
+	}
 
 	
 	
@@ -1211,57 +1226,68 @@ NDIS_STATUS STASendPacket(
 	//	   "NumberOfFrag" is then just used to pre-check if enough free 
 	//	   TXD are available to hold this MSDU.
 
-
-	if (*pSrcBufVA & 0x01)	// fragmentation not allowed on multicast & broadcast
-		NumberOfFrag = 1;
-	else if (OPSTATUS_TEST_FLAG(pAd, fOP_STATUS_AGGREGATION_INUSED))
-		NumberOfFrag = 1;	// Aggregation overwhelms fragmentation
-	else if (CLIENT_STATUS_TEST_FLAG(pEntry, fCLIENT_STATUS_AMSDU_INUSED))
-		NumberOfFrag = 1;	// Aggregation overwhelms fragmentation
-#ifdef DOT11_N_SUPPORT
-	else if ((pAd->StaCfg.HTPhyMode.field.MODE == MODE_HTMIX) || (pAd->StaCfg.HTPhyMode.field.MODE == MODE_HTGREENFIELD))
-		NumberOfFrag = 1;	// MIMO RATE overwhelms fragmentation
-#endif // DOT11_N_SUPPORT //
+	if(!MONITOR_ON(pAd))
+	{
+		if (*pSrcBufVA & 0x01)	// fragmentation not allowed on multicast & broadcast
+			NumberOfFrag = 1;
+		else if (OPSTATUS_TEST_FLAG(pAd, fOP_STATUS_AGGREGATION_INUSED))
+			NumberOfFrag = 1;	// Aggregation overwhelms fragmentation
+		else if (CLIENT_STATUS_TEST_FLAG(pEntry, fCLIENT_STATUS_AMSDU_INUSED))
+			NumberOfFrag = 1;	// Aggregation overwhelms fragmentation
+	#ifdef DOT11_N_SUPPORT
+		else if ((pAd->StaCfg.HTPhyMode.field.MODE == MODE_HTMIX) || (pAd->StaCfg.HTPhyMode.field.MODE == MODE_HTGREENFIELD))
+			NumberOfFrag = 1;	// MIMO RATE overwhelms fragmentation
+	#endif // DOT11_N_SUPPORT //
+		else
+		{
+			// The calculated "NumberOfFrag" is a rough estimation because of various 
+			// encryption/encapsulation overhead not taken into consideration. This number is just
+			// used to make sure enough free TXD are available before fragmentation takes place.
+			// In case the actual required number of fragments of an NDIS packet 
+			// excceeds "NumberOfFrag"caculated here and not enough free TXD available, the
+			// last fragment (i.e. last MPDU) will be dropped in RTMPHardTransmit() due to out of 
+			// resource, and the NDIS packet will be indicated NDIS_STATUS_FAILURE. This should 
+			// rarely happen and the penalty is just like a TX RETRY fail. Affordable.
+	
+			AllowFragSize = (pAd->CommonCfg.FragmentThreshold) - LENGTH_802_11 - LENGTH_CRC;
+			NumberOfFrag = ((PacketInfo.TotalPacketLength - LENGTH_802_3 + LENGTH_802_1_H) / AllowFragSize) + 1;
+			// To get accurate number of fragmentation, Minus 1 if the size just match to allowable fragment size
+			if (((PacketInfo.TotalPacketLength - LENGTH_802_3 + LENGTH_802_1_H) % AllowFragSize) == 0)
+			{
+				NumberOfFrag--;
+			}
+		}
+	}
 	else
 	{
-		// The calculated "NumberOfFrag" is a rough estimation because of various 
-		// encryption/encapsulation overhead not taken into consideration. This number is just
-		// used to make sure enough free TXD are available before fragmentation takes place.
-		// In case the actual required number of fragments of an NDIS packet 
-		// excceeds "NumberOfFrag"caculated here and not enough free TXD available, the
-		// last fragment (i.e. last MPDU) will be dropped in RTMPHardTransmit() due to out of 
-		// resource, and the NDIS packet will be indicated NDIS_STATUS_FAILURE. This should 
-		// rarely happen and the penalty is just like a TX RETRY fail. Affordable.
-
-		AllowFragSize = (pAd->CommonCfg.FragmentThreshold) - LENGTH_802_11 - LENGTH_CRC;
-		NumberOfFrag = ((PacketInfo.TotalPacketLength - LENGTH_802_3 + LENGTH_802_1_H) / AllowFragSize) + 1;
-		// To get accurate number of fragmentation, Minus 1 if the size just match to allowable fragment size
-		if (((PacketInfo.TotalPacketLength - LENGTH_802_3 + LENGTH_802_1_H) % AllowFragSize) == 0)
-		{
-			NumberOfFrag--;
-		}
+		NumberOfFrag = 1;
 	}
 
 	// Save fragment number to Ndis packet reserved field
 	RTMP_SET_PACKET_FRAGMENTS(pPacket, NumberOfFrag);
 
+	if(!MONITOR_ON(pAd))
+	{
+		// STEP 2. Check the requirement of RTS:
+		//	   If multiple fragment required, RTS is required only for the first fragment
+		//	   if the fragment size large than RTS threshold
+		//     For RT28xx, Let ASIC send RTS/CTS
+		//	RTMP_SET_PACKET_RTS(pPacket, 0);
+		if (NumberOfFrag > 1)
+			RTSRequired = (pAd->CommonCfg.FragmentThreshold > pAd->CommonCfg.RtsThreshold) ? 1 : 0;
+		else
+			RTSRequired = (PacketInfo.TotalPacketLength > pAd->CommonCfg.RtsThreshold) ? 1 : 0;
+	
+		// Save RTS requirement to Ndis packet reserved field
+		RTMP_SET_PACKET_RTS(pPacket, RTSRequired);
+	}
 
-	// STEP 2. Check the requirement of RTS:
-	//	   If multiple fragment required, RTS is required only for the first fragment
-	//	   if the fragment size large than RTS threshold
-	//     For RT28xx, Let ASIC send RTS/CTS
-//	RTMP_SET_PACKET_RTS(pPacket, 0);
-	if (NumberOfFrag > 1)
-		RTSRequired = (pAd->CommonCfg.FragmentThreshold > pAd->CommonCfg.RtsThreshold) ? 1 : 0;
-	else
-		RTSRequired = (PacketInfo.TotalPacketLength > pAd->CommonCfg.RtsThreshold) ? 1 : 0;
-
-	// Save RTS requirement to Ndis packet reserved field
-	RTMP_SET_PACKET_RTS(pPacket, RTSRequired);
 	RTMP_SET_PACKET_TXRATE(pPacket, pAd->CommonCfg.TxRate);
 
-
-	RTMP_SET_PACKET_UP(pPacket, UserPriority);
+	if(!MONITOR_ON(pAd))
+	{
+		RTMP_SET_PACKET_UP(pPacket, UserPriority);
+	}
 
 
 	// Make sure SendTxWait queue resource won't be used by other threads
@@ -1278,12 +1304,20 @@ NDIS_STATUS STASendPacket(
 	}
 	else
 	{
-		InsertTailQueueAc(pAd, pEntry, &pAd->TxSwQueue[QueIdx], PACKET_TO_QUEUE_ENTRY(pPacket));
+		if(MONITOR_ON(pAd))
+		{
+			InsertTailQueue(&pAd->TxSwQueue[QueIdx], PACKET_TO_QUEUE_ENTRY(pPacket));
+		}
+		else
+		{
+			InsertTailQueueAc(pAd, pEntry, &pAd->TxSwQueue[QueIdx], PACKET_TO_QUEUE_ENTRY(pPacket));
+		}
 	}
 	RTMP_IRQ_UNLOCK(&pAd->irq_lock, IrqFlags);
 
 #ifdef DOT11_N_SUPPORT
-    if ((pAd->CommonCfg.BACapability.field.AutoBA == TRUE)&& 
+    if (!MONITOR_ON(pAd) &&
+		(pAd->CommonCfg.BACapability.field.AutoBA == TRUE)&& 
 		(pEntry->NoBADataCountDown == 0) &&
         IS_HT_STA(pEntry))
 	{
@@ -1305,7 +1339,9 @@ NDIS_STATUS STASendPacket(
 	}
 #endif // DOT11_N_SUPPORT //
 
-	pAd->RalinkCounters.OneSecOsTxCount[QueIdx]++; // TODO: for debug only. to be removed
+	if(!MONITOR_ON(pAd))
+		pAd->RalinkCounters.OneSecOsTxCount[QueIdx]++; // TODO: for debug only. to be removed
+
 	return NDIS_STATUS_SUCCESS;
 }
 
@@ -2908,6 +2944,129 @@ VOID STA_Fragment_Frame_Tx(
 		}
 
 
+// Based on STA_Legacy_Frame_Tx
+VOID MONITOR_Frame_Tx(
+	IN	PRTMP_ADAPTER	pAd,
+	IN	TX_BLK			*pTxBlk)
+{
+	HEADER_802_11	*pHeader_802_11;
+	PUCHAR			pHeaderBufPtr;
+	USHORT			FreeNumber;
+	BOOLEAN			bVLANPkt;
+	PQUEUE_ENTRY	pQEntry;
+        USHORT                  hLength;
+
+	ASSERT(pTxBlk);
+
+	pQEntry = RemoveHeadQueue(&pTxBlk->TxPacketList);
+	pTxBlk->pPacket = QUEUE_ENTRY_TO_PACKET(pQEntry);
+	if (RTMP_FillTxBlkInfo(pAd, pTxBlk) != TRUE)
+	{
+		RELEASE_NDIS_PACKET(pAd, pTxBlk->pPacket, NDIS_STATUS_FAILURE);
+		return;
+	}
+
+#ifdef STATS_COUNT_SUPPORT
+	if (pTxBlk->TxFrameType == TX_MCAST_FRAME)
+	{
+		INC_COUNTER64(pAd->WlanCounters.MulticastTransmittedFrameCount);
+	}
+#endif // STATS_COUNT_SUPPORT //
+	
+	if (RTMP_GET_PACKET_RTS(pTxBlk->pPacket))
+		TX_BLK_SET_FLAG(pTxBlk, fTX_bRtsRequired);
+	else
+		TX_BLK_CLEAR_FLAG(pTxBlk, fTX_bRtsRequired);
+
+	bVLANPkt = (RTMP_GET_PACKET_VLAN(pTxBlk->pPacket) ? TRUE : FALSE);
+
+	if (pTxBlk->TxRate < pAd->CommonCfg.MinTxRate)
+		pTxBlk->TxRate = pAd->CommonCfg.MinTxRate;
+	
+	STAFindCipherAlgorithm(pAd, pTxBlk);
+	STABuildCommon802_11Header(pAd, pTxBlk);
+
+	DBGPRINT(RT_DEBUG_ERROR, ("TxBlk->SrcBufLen: %d\n", pTxBlk->SrcBufLen));
+
+	if(pTxBlk->SrcBufLen < LENGTH_802_11)
+		hLength = pTxBlk->SrcBufLen;
+	else
+		hLength = LENGTH_802_11;
+
+	DBGPRINT(RT_DEBUG_ERROR, ("hLength: %d\n", hLength));
+
+	// skip 802.3 header (Ethernet)
+	pTxBlk->pSrcBufData = pTxBlk->pSrcBufHeader + hLength;
+	pTxBlk->SrcBufLen  -= hLength;
+
+	DBGPRINT(RT_DEBUG_ERROR, ("MONITOR_Frame_Tx: 0x%02X 0x%02X 0x%02X\n", pTxBlk->pSrcBufHeader[0], pTxBlk->pSrcBufHeader[1], pTxBlk->pSrcBufHeader[2]));
+	DBGPRINT(RT_DEBUG_ERROR, ("MONITOR_Frame_Tx: 0x%02X 0x%02X 0x%02X\n", pTxBlk->pSrcBufData[0], pTxBlk->pSrcBufData[1], pTxBlk->pSrcBufData[2]));
+
+	// skip vlan tag
+	if (bVLANPkt)
+	{
+		pTxBlk->pSrcBufData	+= LENGTH_802_1Q;
+		pTxBlk->SrcBufLen	-= LENGTH_802_1Q;
+	}
+
+	pHeaderBufPtr = &pTxBlk->HeaderBuf[TXINFO_SIZE + TXWI_SIZE];
+	NdisMoveMemory(pHeaderBufPtr, pTxBlk->pSrcBufHeader, hLength);
+	pHeader_802_11 = (HEADER_802_11 *) pHeaderBufPtr;
+
+	DBGPRINT(RT_DEBUG_ERROR, ("MONITOR_Frame_Tx: 0x%02X 0x%02X 0x%02X\n", pTxBlk->pSrcBufHeader[0], pTxBlk->pSrcBufHeader[1], pTxBlk->pSrcBufHeader[2]));
+
+	// skip common header
+	pHeaderBufPtr += pTxBlk->MpduHeaderLen;
+
+	if (TX_BLK_TEST_FLAG(pTxBlk, fTX_bWMM))
+	{
+		//
+		// build QOS Control bytes
+		// 
+		*(pHeaderBufPtr) = ((pTxBlk->UserPriority & 0x0F) | (pAd->CommonCfg.AckPolicy[pTxBlk->QueIdx]<<5));
+		*(pHeaderBufPtr+1) = 0;
+		pHeaderBufPtr +=2;
+		pTxBlk->MpduHeaderLen += 2;
+	}
+
+	DBGPRINT(RT_DEBUG_ERROR, ("MONITOR_Frame_Tx: 0x%02X 0x%02X 0x%02X\n", pTxBlk->pSrcBufHeader[0], pTxBlk->pSrcBufHeader[1], pTxBlk->pSrcBufHeader[2]));
+
+	// The remaining content of MPDU header should locate at 4-octets aligment	
+	pTxBlk->HdrPadLen = (ULONG)pHeaderBufPtr;
+	pHeaderBufPtr = (PUCHAR) ROUND_UP(pHeaderBufPtr, 4);
+	pTxBlk->HdrPadLen = (ULONG)(pHeaderBufPtr - pTxBlk->HdrPadLen);
+
+
+
+	// Mathy:
+	pTxBlk->CipherAlg = CIPHER_NONE;
+
+	//
+	// prepare for TXWI
+	// use Wcid as Key Index
+	//
+
+	RTMPWriteTxWI_Data(pAd, (PTXWI_STRUC)(&pTxBlk->HeaderBuf[TXINFO_SIZE]), pTxBlk);
+
+	//FreeNumber = GET_TXRING_FREENO(pAd, QueIdx);
+
+	HAL_WriteTxResource(pAd, pTxBlk, TRUE, &FreeNumber);
+	
+	pAd->RalinkCounters.KickTxCount++;
+	pAd->RalinkCounters.OneSecTxDoneCount++;
+
+	DBGPRINT(RT_DEBUG_ERROR, ("MONITOR_Frame_Tx: 0x%02X 0x%02X 0x%02X\n", pTxBlk->pSrcBufHeader[0], pTxBlk->pSrcBufHeader[1], pTxBlk->pSrcBufHeader[2]));
+
+	//
+	// Kick out Tx
+	// 
+#ifdef PCIE_PS_SUPPORT
+	if (!RTMP_TEST_PSFLAG(pAd, fRTMP_PS_DISABLE_TX))
+#endif // PCIE_PS_SUPPORT //
+	HAL_KickOutTx(pAd, pTxBlk, pTxBlk->QueIdx);
+}
+
+
 /*
 	========================================================================
 
@@ -2976,41 +3135,48 @@ NDIS_STATUS STAHardTransmit(
 			RTMP_SET_PSM_BIT(pAd, PWR_ACTIVE);
 	}
 
-	switch (pTxBlk->TxFrameType)
+	if(MONITOR_ON(pAd))
 	{
-#ifdef DOT11_N_SUPPORT
-		case TX_AMPDU_FRAME:
-				STA_AMPDU_Frame_Tx(pAd, pTxBlk);
-			break;
-		case TX_AMSDU_FRAME:
-				STA_AMSDU_Frame_Tx(pAd, pTxBlk);
-			break;
-#endif // DOT11_N_SUPPORT //
-		case TX_LEGACY_FRAME:
-				STA_Legacy_Frame_Tx(pAd, pTxBlk);
-			break;
-		case TX_MCAST_FRAME:
-				STA_Legacy_Frame_Tx(pAd, pTxBlk);
-			break;
-		case TX_RALINK_FRAME:
-				STA_ARalink_Frame_Tx(pAd, pTxBlk);
-			break;
-		case TX_FRAG_FRAME:
-				STA_Fragment_Frame_Tx(pAd, pTxBlk);
-			break;
-		default:
-			{
-				// It should not happened!
-				DBGPRINT(RT_DEBUG_ERROR, ("Send a pacekt was not classified!! It should not happen!\n"));
-				while(pTxBlk->TxPacketList.Number)
-				{	
-					pQEntry = RemoveHeadQueue(&pTxBlk->TxPacketList);
-					pPacket = QUEUE_ENTRY_TO_PACKET(pQEntry);
-					if (pPacket)
-						RELEASE_NDIS_PACKET(pAd, pPacket, NDIS_STATUS_FAILURE);
+		MONITOR_Frame_Tx(pAd, pTxBlk);
+	}
+	else
+	{
+		switch (pTxBlk->TxFrameType)
+		{
+	#ifdef DOT11_N_SUPPORT
+			case TX_AMPDU_FRAME:
+					STA_AMPDU_Frame_Tx(pAd, pTxBlk);
+				break;
+			case TX_AMSDU_FRAME:
+					STA_AMSDU_Frame_Tx(pAd, pTxBlk);
+				break;
+	#endif // DOT11_N_SUPPORT //
+			case TX_LEGACY_FRAME:
+					STA_Legacy_Frame_Tx(pAd, pTxBlk);
+				break;
+			case TX_MCAST_FRAME:
+					STA_Legacy_Frame_Tx(pAd, pTxBlk);
+				break;
+			case TX_RALINK_FRAME:
+					STA_ARalink_Frame_Tx(pAd, pTxBlk);
+				break;
+			case TX_FRAG_FRAME:
+					STA_Fragment_Frame_Tx(pAd, pTxBlk);
+				break;
+			default:
+				{
+					// It should not happened!
+					DBGPRINT(RT_DEBUG_ERROR, ("Send a pacekt was not classified!! It should not happen!\n"));
+					while(pTxBlk->TxPacketList.Number)
+					{	
+						pQEntry = RemoveHeadQueue(&pTxBlk->TxPacketList);
+						pPacket = QUEUE_ENTRY_TO_PACKET(pQEntry);
+						if (pPacket)
+							RELEASE_NDIS_PACKET(pAd, pPacket, NDIS_STATUS_FAILURE);
+					}
 				}
-			}
-			break;
+				break;
+		}
 	}
 
 	return (NDIS_STATUS_SUCCESS);
