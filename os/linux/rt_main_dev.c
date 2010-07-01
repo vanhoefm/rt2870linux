@@ -666,8 +666,7 @@ int rt28xx_packet_xmit(struct sk_buff *skb)
 		// Drop send request since we are in monitor mode
 		if (MONITOR_ON(pAd))
 		{
-			RELEASE_NDIS_PACKET(pAd, pPacket, NDIS_STATUS_FAILURE);
-			goto done;
+			goto sendraw;
 		}
 	}
 #endif // CONFIG_STA_SUPPORT //
@@ -692,7 +691,7 @@ int rt28xx_packet_xmit(struct sk_buff *skb)
 #endif
 
 
-
+sendraw:
 #ifdef CONFIG_STA_SUPPORT
 	IF_DEV_CONFIG_OPMODE_ON_STA(pAd)
 	{

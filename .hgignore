@@ -1,0 +1,11 @@
+syntax: glob
+*.o
+*.o.cmd
+tools/bin2h
+os/linux/.rt2870sta.ko.cmd
+os/linux/.tmp_versions/rt2870sta.mod
+os/linux/Makefile
+os/linux/Module.symvers
+os/linux/modules.order
+os/linux/rt2870sta.ko
+os/linux/rt2870sta.mod.c
