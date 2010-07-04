@@ -1093,9 +1093,12 @@ NDIS_STATUS STASendPacket(
 
 	// Mathy: For some reason garbage is prepended to the frame?
 	// TODO: Investigate this in detail
-	for(i = 0; i + 14 < SrcBufLen; ++i)
-		pSrcBufVA[i] = pSrcBufVA[i + 14];
-	SET_OS_PKT_LEN(pPacket, SrcBufLen - 14);
+	if(MONITOR_ON(pAd))
+	{
+		for(i = 0; i + 14 < SrcBufLen; ++i)
+			pSrcBufVA[i] = pSrcBufVA[i + 14];
+		SET_OS_PKT_LEN(pPacket, SrcBufLen - 14);
+	}
 
 	if (pSrcBufVA == NULL)
 	{
