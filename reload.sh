@@ -1,5 +1,8 @@
 #!/bin/sh
 
+# avoid need for explicit blacklists
+rmmod rt2800usb rt2800lib
+
 echo "Putting wireless device down"
 ifconfig ra0 down
 echo "Removing driver module"

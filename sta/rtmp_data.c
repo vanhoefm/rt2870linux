@@ -1812,7 +1812,6 @@ static inline PUCHAR STA_Build_ARalink_Frame_Header(
 	STAFindCipherAlgorithm(pAd, pTxBlk);
 	STABuildCommon802_11Header(pAd, pTxBlk);
 
-
 	pHeaderBufPtr = &pTxBlk->HeaderBuf[TXINFO_SIZE + TXWI_SIZE];
 	pHeader_802_11 = (HEADER_802_11 *) pHeaderBufPtr;
 
@@ -2948,100 +2947,62 @@ VOID STA_Fragment_Frame_Tx(
 
 
 // Based on STA_Legacy_Frame_Tx
+// FIXME: Somewhere we lose the first 6 bytes of the packet... :(
 VOID MONITOR_Frame_Tx(
 	IN	PRTMP_ADAPTER	pAd,
-	IN	TX_BLK			*pTxBlk)
+	IN	TX_BLK		*pTxBlk)
 {
 	HEADER_802_11	*pHeader_802_11;
-	PUCHAR			pHeaderBufPtr;
-	USHORT			FreeNumber;
-	BOOLEAN			bVLANPkt;
+	PUCHAR		pHeaderBufPtr;
+	USHORT		FreeNumber;
 	PQUEUE_ENTRY	pQEntry;
-        USHORT                  hLength;
+        USHORT		hLength;
 
 	ASSERT(pTxBlk);
 
 	pQEntry = RemoveHeadQueue(&pTxBlk->TxPacketList);
 	pTxBlk->pPacket = QUEUE_ENTRY_TO_PACKET(pQEntry);
+
+	// This function (among other things) fills in the pSrcBufHeader pointer
 	if (RTMP_FillTxBlkInfo(pAd, pTxBlk) != TRUE)
 	{
 		RELEASE_NDIS_PACKET(pAd, pTxBlk->pPacket, NDIS_STATUS_FAILURE);
 		return;
 	}
 
-#ifdef STATS_COUNT_SUPPORT
-	if (pTxBlk->TxFrameType == TX_MCAST_FRAME)
-	{
-		INC_COUNTER64(pAd->WlanCounters.MulticastTransmittedFrameCount);
-	}
-#endif // STATS_COUNT_SUPPORT //
-	
-	if (RTMP_GET_PACKET_RTS(pTxBlk->pPacket))
-		TX_BLK_SET_FLAG(pTxBlk, fTX_bRtsRequired);
-	else
-		TX_BLK_CLEAR_FLAG(pTxBlk, fTX_bRtsRequired);
+	// Quick and dirty: fix pointer in monitor mode
+	//DBGPRINT(RT_DEBUG_ERROR, ("MONITOR_Frame_Tx Header: 0x%02X 0x%02X 0x%02X\n", pTxBlk->pSrcBufHeader[0], pTxBlk->pSrcBufHeader[1], pTxBlk->pSrcBufHeader[2]));
 
-	bVLANPkt = (RTMP_GET_PACKET_VLAN(pTxBlk->pPacket) ? TRUE : FALSE);
+	// For monitor mode don't do RTS/CTS	
+	TX_BLK_CLEAR_FLAG(pTxBlk, fTX_bRtsRequired);
 
 	if (pTxBlk->TxRate < pAd->CommonCfg.MinTxRate)
 		pTxBlk->TxRate = pAd->CommonCfg.MinTxRate;
 	
-	STAFindCipherAlgorithm(pAd, pTxBlk);
 	STABuildCommon802_11Header(pAd, pTxBlk);
-
-	DBGPRINT(RT_DEBUG_ERROR, ("TxBlk->SrcBufLen: %d\n", pTxBlk->SrcBufLen));
 
 	if(pTxBlk->SrcBufLen < LENGTH_802_11)
 		hLength = pTxBlk->SrcBufLen;
 	else
-		hLength = LENGTH_802_11;
+		hLength = LENGTH_802_11; // = 24
 
-	DBGPRINT(RT_DEBUG_ERROR, ("hLength: %d\n", hLength));
-
-	// skip 802.3 header (Ethernet)
+	// skip 802.11 header
 	pTxBlk->pSrcBufData = pTxBlk->pSrcBufHeader + hLength;
 	pTxBlk->SrcBufLen  -= hLength;
-
-	DBGPRINT(RT_DEBUG_ERROR, ("MONITOR_Frame_Tx: 0x%02X 0x%02X 0x%02X\n", pTxBlk->pSrcBufHeader[0], pTxBlk->pSrcBufHeader[1], pTxBlk->pSrcBufHeader[2]));
-	DBGPRINT(RT_DEBUG_ERROR, ("MONITOR_Frame_Tx: 0x%02X 0x%02X 0x%02X\n", pTxBlk->pSrcBufData[0], pTxBlk->pSrcBufData[1], pTxBlk->pSrcBufData[2]));
-
-	// skip vlan tag
-	if (bVLANPkt)
-	{
-		pTxBlk->pSrcBufData	+= LENGTH_802_1Q;
-		pTxBlk->SrcBufLen	-= LENGTH_802_1Q;
-	}
 
 	pHeaderBufPtr = &pTxBlk->HeaderBuf[TXINFO_SIZE + TXWI_SIZE];
 	NdisMoveMemory(pHeaderBufPtr, pTxBlk->pSrcBufHeader, hLength);
 	pHeader_802_11 = (HEADER_802_11 *) pHeaderBufPtr;
 
-	DBGPRINT(RT_DEBUG_ERROR, ("MONITOR_Frame_Tx: 0x%02X 0x%02X 0x%02X\n", pTxBlk->pSrcBufHeader[0], pTxBlk->pSrcBufHeader[1], pTxBlk->pSrcBufHeader[2]));
-
 	// skip common header
 	pHeaderBufPtr += pTxBlk->MpduHeaderLen;
-
-	if (TX_BLK_TEST_FLAG(pTxBlk, fTX_bWMM))
-	{
-		//
-		// build QOS Control bytes
-		// 
-		*(pHeaderBufPtr) = ((pTxBlk->UserPriority & 0x0F) | (pAd->CommonCfg.AckPolicy[pTxBlk->QueIdx]<<5));
-		*(pHeaderBufPtr+1) = 0;
-		pHeaderBufPtr +=2;
-		pTxBlk->MpduHeaderLen += 2;
-	}
-
-	DBGPRINT(RT_DEBUG_ERROR, ("MONITOR_Frame_Tx: 0x%02X 0x%02X 0x%02X\n", pTxBlk->pSrcBufHeader[0], pTxBlk->pSrcBufHeader[1], pTxBlk->pSrcBufHeader[2]));
 
 	// The remaining content of MPDU header should locate at 4-octets aligment	
 	pTxBlk->HdrPadLen = (ULONG)pHeaderBufPtr;
 	pHeaderBufPtr = (PUCHAR) ROUND_UP(pHeaderBufPtr, 4);
 	pTxBlk->HdrPadLen = (ULONG)(pHeaderBufPtr - pTxBlk->HdrPadLen);
 
-
-
-	// Mathy:
+	// Mathy
 	pTxBlk->CipherAlg = CIPHER_NONE;
 
 	//
@@ -3051,14 +3012,9 @@ VOID MONITOR_Frame_Tx(
 
 	RTMPWriteTxWI_Data(pAd, (PTXWI_STRUC)(&pTxBlk->HeaderBuf[TXINFO_SIZE]), pTxBlk);
 
-	//FreeNumber = GET_TXRING_FREENO(pAd, QueIdx);
-
 	HAL_WriteTxResource(pAd, pTxBlk, TRUE, &FreeNumber);
-	
 	pAd->RalinkCounters.KickTxCount++;
 	pAd->RalinkCounters.OneSecTxDoneCount++;
-
-	DBGPRINT(RT_DEBUG_ERROR, ("MONITOR_Frame_Tx: 0x%02X 0x%02X 0x%02X\n", pTxBlk->pSrcBufHeader[0], pTxBlk->pSrcBufHeader[1], pTxBlk->pSrcBufHeader[2]));
 
 	//
 	// Kick out Tx
