@@ -1640,7 +1640,11 @@ static struct net_device_ops RALINK_Netdev_Ops = {
          .ndo_stop               = NULL,
          .ndo_start_xmit         = NULL,
          .ndo_get_stats          = NULL,
-         .ndo_set_multicast_list = NULL,
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,2,0)
+         .ndo_set_rx_mode        = NULL,
+#else
+	 .ndo_set_multicast_list = NULL,
+#endif
          .ndo_do_ioctl           = NULL,
          .ndo_tx_timeout         = NULL,
          .ndo_change_mtu         = NULL,

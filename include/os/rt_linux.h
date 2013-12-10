@@ -1002,8 +1002,15 @@ typedef struct usb_device_id USB_DEVICE_ID;
 #define RT28XX_PUT_DEVICE													usb_put_dev
 #define RTUSB_ALLOC_URB(iso)												usb_alloc_urb(iso, GFP_ATOMIC)
 #define RTUSB_SUBMIT_URB(pUrb)												usb_submit_urb(pUrb, GFP_ATOMIC)
-#define RTUSB_URB_ALLOC_BUFFER(pUsb_Dev, BufSize, pDma_addr)				usb_buffer_alloc(pUsb_Dev, BufSize, GFP_ATOMIC, pDma_addr)
-#define RTUSB_URB_FREE_BUFFER(pUsb_Dev, BufSize, pTransferBuf, Dma_addr)	usb_buffer_free(pUsb_Dev, BufSize, pTransferBuf, Dma_addr)
+
+	#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,36)
+	#define RTUSB_URB_ALLOC_BUFFER(pUsb_Dev, BufSize, pDma_addr)				usb_alloc_coherent(pUsb_Dev, BufSize, GFP_ATOMIC, pDma_addr)
+	#define RTUSB_URB_FREE_BUFFER(pUsb_Dev, BufSize, pTransferBuf, Dma_addr)	usb_free_coherent(pUsb_Dev, BufSize, pTransferBuf, Dma_addr)
+	#else
+	#define RTUSB_URB_ALLOC_BUFFER(pUsb_Dev, BufSize, pDma_addr)				usb_buffer_alloc(pUsb_Dev, BufSize, GFP_ATOMIC, pDma_addr)
+	#define RTUSB_URB_FREE_BUFFER(pUsb_Dev, BufSize, pTransferBuf, Dma_addr)	usb_buffer_free(pUsb_Dev, BufSize, pTransferBuf, Dma_addr)
+	#endif
+
 #else
 
 #define RT28XX_PUT_DEVICE													rausb_put_dev
